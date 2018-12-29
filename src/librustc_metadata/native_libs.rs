@@ -9,6 +9,7 @@ use syntax::attr;
 use syntax::source_map::Span;
 use syntax::feature_gate::{self, GateIssue};
 use syntax::symbol::Symbol;
+use errors::{Applicability, DiagnosticId};
 
 pub fn collect<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) -> Vec<NativeLibrary> {
     let mut collector = Collector {
@@ -49,7 +50,23 @@ impl<'a, 'tcx> ItemLikeVisitor<'tcx> for Collector<'a, 'tcx> {
         for m in it.attrs.iter().filter(|a| a.check_name("link")) {
             let items = match m.meta_item_list() {
                 Some(item) => item,
-                None => continue,
+                None => {
+                    let mut err = self.tcx.sess.struct_span_err_with_code(
+                        m.span,
+                        "#[link(...)] specified without arguments",
+                        DiagnosticId::Error("E0459".into()),
+                    );
+                    if let Some(value) = m.value_str() {
+                        err.span_suggestion_with_applicability(
+                            m.span,
+                            "specify a `name` argument instead",
+                            format!("#[link(name = \"{}\")]", value),
+                            Applicability::MachineApplicable,
+                        );
+                    }
+                    err.emit();
+                    continue;
+                }
             };
             let mut lib = NativeLibrary {
                 name: None,
@@ -61,7 +78,17 @@ impl<'a, 'tcx> ItemLikeVisitor<'tcx> for Collector<'a, 'tcx> {
             let mut kind_specified = false;
 
             for item in items.iter() {
+                let handle_duplicate_arg = |name, report| {
+                    if report {
+                        struct_span_err!(self.tcx.sess, m.span, E0649,
+                            "#[link(...)] contains repeated `{}` arguments", name)
+                        .span_label(item.span, format!("repeated `{}` argument", name))
+                        .emit();
+                    }
+                };
+
                 if item.check_name("kind") {
+                    handle_duplicate_arg("kind", kind_specified);
                     kind_specified = true;
                     let kind = match item.value_str() {
                         Some(name) => name,
@@ -80,8 +107,10 @@ impl<'a, 'tcx> ItemLikeVisitor<'tcx> for Collector<'a, 'tcx> {
                         }
                     };
                 } else if item.check_name("name") {
+                    handle_duplicate_arg("name", lib.name.is_some());
                     lib.name = item.value_str();
                 } else if item.check_name("cfg") {
+                    handle_duplicate_arg("cfg", lib.cfg.is_some());
                     let cfg = match item.meta_item_list() {
                         Some(list) => list,
                         None => continue, // skip like historical compilers
@@ -97,6 +126,7 @@ impl<'a, 'tcx> ItemLikeVisitor<'tcx> for Collector<'a, 'tcx> {
                         self.tcx.sess.span_err(cfg[0].span(), "invalid argument for `cfg(..)`");
                     }
                 } else if item.check_name("wasm_import_module") {
+                    handle_duplicate_arg("wasm_import_module", lib.wasm_import_module.is_some());
                     match item.value_str() {
                         Some(s) => lib.wasm_import_module = Some(s),
                         None => {
@@ -157,7 +187,7 @@ impl<'a, 'tcx> Collector<'a, 'tcx> {
                                            "link_cfg",
                                            span.unwrap(),
                                            GateIssue::Language,
-                                           "is feature gated");
+                                           "#[link(cfg(...))] is feature gated");
         }
         if lib.kind == cstore::NativeStaticNobundle &&
            !self.tcx.features().static_nobundle {
@@ -165,7 +195,7 @@ impl<'a, 'tcx> Collector<'a, 'tcx> {
                                            "static_nobundle",
                                            span.unwrap(),
                                            GateIssue::Language,
-                                           "kind=\"static-nobundle\" is feature gated");
+                                           "#[link(kind=\"static-nobundle\")] is feature gated");
         }
         self.libs.push(lib);
     }
